@@ -131,6 +131,26 @@ function normalizeProxyMode(mode) {
   return 'none';
 }
 
+async function probeProxyHealth(mode) {
+  const healthUrl = mode === 'hosted'
+    ? `${HOSTED_PROXY_BASE}/health`
+    : `${LOCAL_PROXY_BASE}/health`;
+
+  try {
+    const response = await fetchJsonWithTimeout(healthUrl, { cache: 'no-store' }, 2500);
+    if (!response.ok) return null;
+    const text = await response.text();
+    const payload = parseJsonText(text) || {};
+    return {
+      ok: true,
+      tokenLoaded: Boolean(payload?.tokenLoaded),
+      mode
+    };
+  } catch {
+    return null;
+  }
+}
+
 function getPreferredProxyMode() {
   try {
     const params = new URLSearchParams(window.location.search || '');
@@ -383,12 +403,36 @@ async function detectLocalProxy(token) {
   localProxyAvailable = false;
   activeProxyMode = 'none';
 
-  if (!tokenPresent && preferredMode !== 'none') {
+  const tokenInput = document.getElementById('tokenInput');
+
+  const selectProxyMode = (mode, health) => {
+    if (!health || !health.ok || !health.tokenLoaded) return false;
     localProxyAvailable = true;
-    activeProxyMode = preferredMode;
+    activeProxyMode = mode;
+    return true;
+  };
+
+  if (preferredMode === 'hosted') {
+    const hostedHealth = await probeProxyHealth('hosted');
+    if (!selectProxyMode('hosted', hostedHealth)) {
+      setAuthHint('Hosted proxy was requested but is unavailable or missing server token. Falling back to direct mode.');
+    }
+  } else if (preferredMode === 'local') {
+    const localHealth = await probeProxyHealth('local');
+    if (!selectProxyMode('local', localHealth)) {
+      setAuthHint('Local proxy was requested but is unavailable or missing local token. Falling back to direct mode.');
+    }
+  } else {
+    const [hostedHealth, localHealth] = await Promise.all([
+      probeProxyHealth('hosted'),
+      probeProxyHealth('local')
+    ]);
+
+    if (!selectProxyMode('hosted', hostedHealth)) {
+      selectProxyMode('local', localHealth);
+    }
   }
 
-  const tokenInput = document.getElementById('tokenInput');
   if (activeProxyMode === 'hosted') {
     setAuthHint('Auth mode: hosted proxy (manual). If unavailable, switch to direct mode by removing ?proxy=hosted or set ?proxy=none.');
     if (tokenInput) tokenInput.placeholder = 'Hosted proxy active: token not required here';
@@ -396,7 +440,11 @@ async function detectLocalProxy(token) {
     setAuthHint('Auth mode: local proxy (manual). If unavailable, switch to direct mode by removing ?proxy=local or set ?proxy=none.');
     if (tokenInput) tokenInput.placeholder = 'Local proxy active: token not required here';
   } else {
-    setAuthHint('Auth mode: direct browser mode. Paste token here, or use hosted/local proxy mode.');
+    if (!tokenPresent && preferredMode === 'none') {
+      setAuthHint('Auth mode: direct browser mode. No healthy proxy detected; paste token here or configure hosted/local proxy token.');
+    } else {
+      setAuthHint('Auth mode: direct browser mode. Paste token here, or use hosted/local proxy mode.');
+    }
     if (tokenInput) tokenInput.placeholder = 'Optional GitHub token (raises rate limits)';
   }
 }
@@ -1151,12 +1199,16 @@ async function refreshInsights() {
     setStatus('Refreshing live repository data...');
     await detectLocalProxy(token);
     tokenStatus = await validateTokenStatus(token);
+    const effectiveToken = tokenProvided && tokenStatus.accepted ? token : '';
 
     if (tokenProvided && tokenStatus.accepted) {
       const resetNote = tokenStatus.reset ? `, resets ${new Date(tokenStatus.reset * 1000).toLocaleTimeString()}` : '';
       setAuthHint(`Auth mode: direct token verified (${formatNumber(tokenStatus.remaining)}/${formatNumber(tokenStatus.limit)} remaining${resetNote}).`);
     } else if (tokenProvided && !tokenStatus.accepted) {
-      setAuthHint(`Auth mode: token rejected by GitHub${tokenStatus.status ? ` (${tokenStatus.status})` : ''}. Check token permissions and org SSO.`);
+      const fallbackSource = localProxyAvailable
+        ? `${activeProxyMode} proxy`
+        : 'public GitHub API';
+      setAuthHint(`Auth mode: token rejected by GitHub${tokenStatus.status ? ` (${tokenStatus.status})` : ''}. Falling back to ${fallbackSource}. Check token permissions and org SSO.`);
     }
 
     const base = `https://api.github.com/repos/${repoSlug}`;
@@ -1166,7 +1218,7 @@ async function refreshInsights() {
 
     async function safeFetch(url) {
       try {
-        return await ghFetch(url, token);
+        return await ghFetch(url, effectiveToken);
       } catch (error) {
         if (error?.name === 'AbortError') {
           errors.push(`Request timed out: ${url}`);
@@ -1181,7 +1233,7 @@ async function refreshInsights() {
       safeFetch(base),
       safeFetch(`${base}/languages`),
       fetchAllContributors(base, safeFetch),
-      fetchContributorStatsWithRetry(base, token, notices),
+      fetchContributorStatsWithRetry(base, effectiveToken, notices),
       safeFetch(`https://api.github.com/search/issues?q=repo:${repoSlug}+is:issue+is:open`),
       safeFetch(`https://api.github.com/search/issues?q=repo:${repoSlug}+is:issue+is:closed`),
       safeFetch(`https://api.github.com/search/issues?q=repo:${repoSlug}+is:pr+is:open`),

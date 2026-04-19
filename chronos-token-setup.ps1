@@ -72,7 +72,7 @@ if ($CreateStartupShortcut) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = 'powershell.exe'
-    $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"$proxyScript\""
+    $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File '$proxyScript'"
     $shortcut.WorkingDirectory = $PSScriptRoot
     $shortcut.Save()
 
