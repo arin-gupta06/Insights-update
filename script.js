@@ -250,9 +250,23 @@ async function ghFetchResponse(url, token) {
   }
 
   const headers = { Accept: 'application/vnd.github+json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (token) headers.Authorization = `token ${token}`;
 
   return fetchJsonWithTimeout(url, { headers });
+}
+
+async function ghFetchResponseNoAuth(url) {
+  return fetchJsonWithTimeout(url, { headers: { Accept: 'application/vnd.github+json' } });
+}
+
+function shouldRetryAsPublic(url, token, status, apiMessage) {
+  if (!token) return false;
+  if (status !== 401 && status !== 403) return false;
+  if (!/^https:\/\/api\.github\.com\//i.test(String(url || ''))) return false;
+
+  const text = String(apiMessage || '').toLowerCase();
+  if (text.includes('rate limit') || text.includes('abuse')) return false;
+  return true;
 }
 
 async function ghFetch(url, token) {
@@ -267,7 +281,27 @@ async function ghFetch(url, token) {
     const authHint = token ? '' : ' Add a GitHub token in the optional field to increase rate limits.';
 
     if (response.status === 403 && String(apiMessage).toLowerCase().includes('resource not accessible by personal access token')) {
+      if (shouldRetryAsPublic(url, token, response.status, apiMessage)) {
+        const retry = await ghFetchResponseNoAuth(url);
+        if (retry.ok) {
+          const retryText = await retry.text();
+          return parseJsonText(retryText);
+        }
+      }
       throw new Error(`GitHub API 403 for ${url}. Resource not accessible by personal access token. Grant this repository to your fine-grained token or use a classic PAT.`);
+    }
+
+    if (shouldRetryAsPublic(url, token, response.status, apiMessage)) {
+      const retry = await ghFetchResponseNoAuth(url);
+      if (retry.ok) {
+        const retryText = await retry.text();
+        return parseJsonText(retryText);
+      }
+
+      const retryBodyText = await retry.text();
+      const retryBody = parseJsonText(retryBodyText) || {};
+      const retryMessage = retryBody?.message || retryBodyText || 'unknown error';
+      throw new Error(`GitHub API ${response.status} for ${url}. ${apiMessage}. Retry without token also failed (${retry.status}: ${retryMessage}).`);
     }
 
     const extra = remaining === '0' ? `${resetText}${authHint}` : authHint;
@@ -285,7 +319,7 @@ async function validateTokenStatus(token) {
     const response = await fetchJsonWithTimeout('https://api.github.com/rate_limit', {
       headers: {
         Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`
+        Authorization: `token ${token}`
       }
     });
 
@@ -324,7 +358,19 @@ async function ghFetchAllowAccepted(url, token) {
   }
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`GitHub API ${response.status} for ${url}. ${text || ''}`.trim());
+    const payload = parseJsonText(text) || {};
+    const apiMessage = payload?.message || text || 'unknown error';
+
+    if (shouldRetryAsPublic(url, token, response.status, apiMessage)) {
+      const retry = await ghFetchResponseNoAuth(url);
+      if (retry.status === 202) return { __pending: true };
+      if (retry.ok) {
+        const retryText = await retry.text();
+        return parseJsonText(retryText);
+      }
+    }
+
+    throw new Error(`GitHub API ${response.status} for ${url}. ${apiMessage}`.trim());
   }
   const text = await response.text();
   return parseJsonText(text);
